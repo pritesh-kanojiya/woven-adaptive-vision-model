@@ -1,0 +1,191 @@
+name: Test - Model Inference (MNIST DataSet Model Only)
+run-name: Testing inference for woven-adaptive-mnist-model version ${{ inputs.image_tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker image tag of woven-adaptive-mnist-model'
+        required: true
+        default: 'latest'
+        type: string
+      expected_accuracy:
+        description: 'Minimum expected accuracy threshold (0.0-1.0)'
+        required: true
+        default: '0.8'
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+defaults:
+  run:
+    # Enable strict error handling: exit on error, undefined variables, and pipe failures
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  test_inference:
+    runs-on: ubuntu-latest
+    env:
+      MODEL_NAME: woven-adaptive-mnist-model
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: 📋 Record Workflow Inputs
+      if: always()
+      run: |
+        echo "# 🧪 Inference Tester - Workflow Inputs" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| **Model Name** | \`${{ env.MODEL_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Image Tag** | \`${{ inputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Expected Accuracy** | \`${{ inputs.expected_accuracy }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Docker Image:** \`ghcr.io/${{ github.actor }}/${{ env.MODEL_NAME }}:${{ inputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Run ID:** \`${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+    
+    - name: Verify test images exist
+      run: |
+        echo "🔍 Checking for test images in repo..."
+        if [ -d "test_images" ]; then
+          echo ""
+          echo "� Test images count: $(find test_images -name "*.png" | wc -l)"
+          
+          if [ -f "test_images/ground_truth.json" ]; then
+            echo "✅ Ground truth file found"
+            cat test_images/ground_truth.json
+          else
+            echo "❌ Ground truth file missing - creating basic one"
+            # Create a basic ground truth file if missing
+            echo '[
+              {"image_id": 0, "image_path": "test_images/digit_0.png", "true_label": 0},
+              {"image_id": 1, "image_path": "test_images/digit_1.png", "true_label": 1},
+              {"image_id": 2, "image_path": "test_images/digit_2.png", "true_label": 2},
+              {"image_id": 3, "image_path": "test_images/digit_3.png", "true_label": 3},
+              {"image_id": 4, "image_path": "test_images/digit_4.png", "true_label": 4}
+            ]' > test_images/ground_truth.json
+          fi
+        else
+          echo "❌ No test_images directory found in repo"
+          echo "Please add test images to test_images/ directory with ground_truth.json"
+          exit 1
+        fi
+    
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Pull and cache Docker image
+      run: |
+        echo "🐳 Pulling Docker image for testing..."
+        IMAGE_TAG="${{ inputs.image_tag }}"
+        if [ -z "$IMAGE_TAG" ] || [ "$IMAGE_TAG" = "latest" ]; then
+          IMAGE_TAG="latest"
+        fi
+
+        IMAGE_NAME="ghcr.io/${{ github.actor }}/${{ env.MODEL_NAME }}:${IMAGE_TAG}"
+        echo "Image: $IMAGE_NAME"
+        
+        docker pull "$IMAGE_NAME"
+        
+        echo "📊 Image information:"
+        docker images "$IMAGE_NAME"
+        
+        # Tag as 'test-image' for consistent reference
+        docker tag "$IMAGE_NAME" test-model:latest
+        
+        echo "✅ Image pulled and tagged successfully"
+    
+    - name: Start container and wait for readiness
+      run: |
+        echo "🚀 Starting Docker container..."
+        docker run -d -p 8000:8000 --name test-container test-model:latest
+        
+        echo "⏳ Waiting for container to be ready..."
+        sleep 10
+        
+        # Wait for health check
+        for i in {1..30}; do
+          if curl -f http://localhost:8000/health >/dev/null 2>&1; then
+            echo "✅ Container is healthy and ready"
+            break
+          fi
+          echo "Waiting for container... ($i/30)"
+          sleep 2
+        done
+        
+        # Test if container is responding
+        if ! curl -f http://localhost:8000/health; then
+          echo "❌ Container health check failed"
+          docker logs test-container
+          exit 1
+        fi
+        
+        echo "🎯 Container ready for testing!"
+    
+    - name: Setup Python dependencies
+      run: |
+        echo "🐍 Setting up Python dependencies for testing..."
+        pip install --no-cache-dir Pillow numpy requests
+    
+    - name: Test model inference with Python script
+      run: |
+        echo "🧪 Running inference tests with dedicated Python script..."
+        export EXPECTED_ACCURACY="${{ inputs.expected_accuracy }}"
+        
+        # Run our dedicated test script
+        python3 scripts/test_inference_api.py \
+          --api-url http://localhost:8000 \
+          --images-dir test_images \
+          --ground-truth test_images/ground_truth.json \
+          --output results.csv
+    
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: inference-test-results-${{ inputs.image_tag || 'latest' }}
+        path: |
+          results.csv
+        retention-days: 30
+    
+    - name: Container logs and cleanup
+      if: always()
+      run: |
+        echo "📋 Container logs (last 50 lines):"
+        docker logs --tail 50 test-container || true
+        
+        echo ""
+        echo "🧹 Cleaning up..."
+        docker stop test-container || true
+        docker rm test-container || true
+        docker rmi test-model:latest || true
+    
+    - name: Test Summary
+      if: always()
+      run: |
+        echo "## 🧪 Model Inference Test Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📊 Test Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image Tag**: \`${{ inputs.image_tag || 'latest' }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Total Tests**: ${TOTAL_COUNT:-0}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Successful Predictions**: ${SUCCESS_COUNT:-0}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Accuracy**: ${ACCURACY:-0.000}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Result**: ${RESULT:-UNKNOWN}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🐳 Tested Image" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+        echo "docker pull ghcr.io/${{ github.actor }}/${{ env.MODEL_NAME }}:${{ inputs.image_tag || 'latest' }}" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

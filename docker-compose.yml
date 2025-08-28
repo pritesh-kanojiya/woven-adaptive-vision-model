@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  woven-adaptive-vision-model-inference:
+    image: <ghcr.io_image_url>:<image_version>
+    container_name: <model_name>-inference
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_NAME=<model_name>
+      - MODEL_VERSION=<model_version>
+      - LOG_LEVEL=INFO

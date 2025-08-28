@@ -1,0 +1,44 @@
+artifacts:
+  save_dir: ./artifacts
+  save_model: true
+  save_plots: true
+  save_reports: true
+data:
+  batch_size: 64
+  data_dir: ./data
+  dataset_name: mnist
+  download: true
+  format: pytorch
+  image_size:
+  - 28
+  - 28
+  normalization:
+    mean:
+    - 0.1307
+    std:
+    - 0.3081
+  num_workers: 2
+evaluation:
+  metrics:
+  - accuracy
+  - loss
+  - f1_score
+  required_accuracy: 0.95
+logging:
+  level: INFO
+  log_dir: ./artifacts/logs
+  save_logs: true
+model:
+  input_channels: 1
+  input_shape:
+  - 1
+  - 28
+  - 28
+  name: woven-adaptive-mnist-model
+  num_classes: 10
+  type: SimpleCNN
+  version: v1.0.1
+training:
+  device: cpu
+  learning_rate: 0.001
+  max_epochs: 5

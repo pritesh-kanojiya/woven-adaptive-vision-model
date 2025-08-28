@@ -1,0 +1,930 @@
+name: MLOps Pipeline - Woven Adaptive Vision Models
+run-name: Running mlops pipeline for ${{ inputs.model_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      learning_rate:
+        description: 'Learning rate for training'
+        required: true
+        default: '0.001'
+        type: string
+      max_epochs:
+        description: 'Maximum training epochs'
+        required: true
+        default: '5'
+        type: string
+      required_accuracy:
+        description: 'Minimum accuracy threshold'
+        required: true
+        default: '0.95'
+        type: string
+      dataset:
+        description: 'Dataset source (HuggingFace author/dataset, or mnist)'
+        required: true
+        default: 'mnist'
+        type: string
+      model_name:
+        description: 'Name for the model and Docker image'
+        required: true
+        default: 'woven-adaptive-mnist-model'
+        type: string
+      build_push_docker:
+        description: 'Build and push Docker image to registry'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+  checks: write
+  packages: write
+  attestations: write
+  id-token: write
+
+defaults:
+  run:
+    # Enable strict error handling: exit on error, undefined variables, and pipe failures
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  # Initialize the run for config errors and caching data
+  initialize_run:
+    runs-on: ubuntu-latest
+    outputs:
+      cache-hit: ${{ steps.cache.outputs.cache-hit }}
+      cache-key: ${{ steps.cache-key.outputs.key }}
+      learning_rate: ${{ env.LEARNING_RATE }}
+      max_epochs: ${{ env.MAX_EPOCHS }}
+      required_accuracy: ${{ env.REQUIRED_ACCURACY }}
+      build_push_docker: ${{ env.BUILD_PUSH_DOCKER }}
+      dataset_name: ${{ env.DATASET_NAME }}
+      model_version: ${{ steps.version.outputs.version }}
+      date: ${{ steps.version.outputs.date }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
+    
+    env:
+      LEARNING_RATE: ${{ github.event.inputs.learning_rate || '0.001' }}
+      MAX_EPOCHS: ${{ github.event.inputs.max_epochs || '10' }}
+      REQUIRED_ACCURACY: ${{ github.event.inputs.required_accuracy || '0.95' }}
+      BUILD_PUSH_DOCKER: ${{ github.event.inputs.build_push_docker || 'false' }}
+      DATASET_NAME: ${{ github.event.inputs.dataset || '' }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: 📋 Record Workflow Inputs
+      if: always()
+      run: |
+        echo "# 🎯 MLOps Pipeline - Workflow Inputs" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| **Model Name** | \`${{ inputs.model_name }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Dataset** | \`${{ inputs.dataset }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Learning Rate** | \`${{ inputs.learning_rate }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Max Epochs** | \`${{ inputs.max_epochs }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Required Accuracy** | \`${{ inputs.required_accuracy }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Build Docker** | \`${{ inputs.build_push_docker }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Run ID:** \`${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Generate cache key
+      id: cache-key
+      run: |
+        CACHE_KEY="${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}"
+        echo "key=$CACHE_KEY" >> $GITHUB_OUTPUT
+        echo "Cache key: $CACHE_KEY"
+        
+    - name: Cache pip dependencies
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ steps.cache-key.outputs.key }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+          
+    - name: Install dependencies (if cache miss)
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: |
+        echo "📦 Cache miss - installing dependencies..."
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        echo "✅ Dependencies installed and cached"
+        
+    - name: Dependencies ready
+      if: steps.cache.outputs.cache-hit == 'true'
+      run: |
+        echo "🎯 Cache hit - dependencies already cached!"
+        echo "📊 Subsequent jobs will install much faster using cache"
+
+    - name: Generate model version number
+      id: version
+      run: |
+        # Generate model version
+        DATE=$(date +'%Y.%m.%d')
+        SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+        VERSION="v${DATE}-${SHORT_SHA}_${{ github.run_number }}"
+        
+        echo "Model version: $VERSION"
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "date=$DATE" >> $GITHUB_OUTPUT
+        echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+        
+        # Set as environment variable for subsequent steps
+        echo "MODEL_VERSION=$VERSION" >> $GITHUB_ENV
+
+  unit_tests:
+    needs: initialize_run
+    runs-on: ubuntu-latest
+    outputs:
+      dataset_format: ${{ steps.dataset_prep.outputs.detected_format }}
+      prepared_data_dir: ${{ steps.dataset_prep.outputs.prepared_data_dir }}
+    
+    env:
+      LEARNING_RATE: ${{ needs.initialize_run.outputs.learning_rate }}
+      MAX_EPOCHS: ${{ needs.initialize_run.outputs.max_epochs }}
+      REQUIRED_ACCURACY: ${{ needs.initialize_run.outputs.required_accuracy }}
+      BUILD_PUSH_DOCKER: ${{ needs.initialize_run.outputs.build_push_docker }}
+      DATASET_NAME: ${{ needs.initialize_run.outputs.dataset_name }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        
+    - name: Restore shared cache
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ needs.initialize_run.outputs.cache-key }}
+        fail-on-cache-miss: true
+          
+    - name: Verify cache and dependencies
+      run: |
+        echo "🎯 Using shared cache for fast installation..."
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt  # Fast - uses cached packages
+        python -c "import torch; print(f'✅ PyTorch {torch.__version__} available')"
+        python -c "import pandas; print('✅ Pandas available')"
+        python -c "import numpy; print('✅ NumPy available')"
+        echo "🚀 All dependencies ready!"
+        
+    - name: Validate dataset (fail-fast)
+      id: dataset_prep
+      env:
+        DATASET_NAME: ${{ env.DATASET_NAME }}
+      run: |
+        echo "🔍 Validating dataset..."
+        python3 scripts/prepare_and_validate_dataset.py
+        echo "✅ Dataset validation complete"
+
+    - name: Update configuration with runtime parameters
+      run: python3 scripts/update_config.py
+        
+    - name: Run quick test
+      run: |
+        echo "🧪 Running unit tests and quick validation..."
+        
+        # Run the test
+        python main.py quick-test
+        if [ $? -ne 0 ]; then
+          echo "::error:: Quick test failed - stopping workflow"
+          exit 1
+        fi
+        echo "✅ Quick test passed successfully"
+
+
+    
+  training_and_testing:
+    needs: [initialize_run, unit_tests]
+    runs-on: ubuntu-latest
+    
+    env:
+      LEARNING_RATE: ${{ needs.initialize_run.outputs.learning_rate }}
+      MAX_EPOCHS: ${{ needs.initialize_run.outputs.max_epochs }}
+      REQUIRED_ACCURACY: ${{ needs.initialize_run.outputs.required_accuracy }}
+      BUILD_PUSH_DOCKER: ${{ needs.initialize_run.outputs.build_push_docker }}
+      DATASET_FORMAT: ${{ needs.unit_tests.outputs.dataset_format }}
+      DATASET_NAME: ${{ needs.initialize_run.outputs.dataset_name }}
+      PREPARED_DATA_DIR: ${{ needs.unit_tests.outputs.prepared_data_dir }}
+    
+    outputs:
+      accuracy: ${{ steps.accuracy_check.outputs.accuracy }}
+      meets_threshold: ${{ steps.accuracy_check.outputs.meets_threshold }}
+      model_name: ${{ steps.accuracy_check.outputs.model_name }}
+      model_version: ${{ needs.initialize_run.outputs.model_version }}
+      loss: ${{ steps.accuracy_check.outputs.loss }}
+      training_time: ${{ steps.accuracy_check.outputs.training_time }}
+      learning_rate: ${{ env.LEARNING_RATE }}
+      max_epochs: ${{ env.MAX_EPOCHS }}
+      required_accuracy: ${{ env.REQUIRED_ACCURACY }}
+      build_push_docker: ${{ env.BUILD_PUSH_DOCKER }}
+      dataset_format: ${{ env.DATASET_FORMAT }}
+      dataset_name: ${{ env.DATASET_NAME }}
+      date: ${{ needs.initialize_run.outputs.date }}
+      short_sha: ${{ needs.initialize_run.outputs.short_sha }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        
+    - name: Restore shared cache
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ needs.initialize_run.outputs.cache-key }}
+        fail-on-cache-miss: true
+          
+    - name: Verify cache and dependencies
+      run: |
+        echo "🎯 Using shared cache for fast installation..."
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt  # Fast - uses cached packages
+        python -c "import torch; print(f'✅ PyTorch {torch.__version__} available')"
+        echo "🚀 All dependencies ready!"
+        
+    - name: Run full training
+      env:
+        DATASET_FORMAT: ${{ env.DATASET_FORMAT }}
+        MODEL_NAME: ${{ inputs.model_name }}
+        DATASET_NAME: ${{ env.DATASET_NAME }}
+        LEARNING_RATE: ${{ env.LEARNING_RATE }}
+        MAX_EPOCHS: ${{ env.MAX_EPOCHS }}
+        REQUIRED_ACCURACY: ${{ env.REQUIRED_ACCURACY }}
+      run: |
+        echo "🚀 Starting training with dataset format: ${{ env.DATASET_FORMAT }}"
+        if [ -n "${{ env.DATASET_NAME }}" ]; then
+          echo "Using dataset: ${{ env.DATASET_NAME }}"
+        fi
+        
+        # Prepare training command
+        TRAIN_CMD="python main.py train"
+        
+        echo "🎯 Training command: $TRAIN_CMD"
+        
+        # Run training and capture exit code
+        $TRAIN_CMD
+        TRAINING_EXIT_CODE=$?
+        
+        if [ $TRAINING_EXIT_CODE -ne 0 ]; then
+          echo "❌ Training failed with exit code: $TRAINING_EXIT_CODE"
+          echo "🔍 Check logs for detailed error information"
+          exit $TRAINING_EXIT_CODE
+        fi
+        
+        echo "✅ Training completed successfully"
+        
+    - name: Upload training artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: ${{ inputs.model_name }}-artifacts-${{ needs.initialize_run.outputs.model_version }}
+        path: |
+          artifacts/
+        retention-days: 30
+
+    - name: Check model accuracy
+      id: accuracy_check
+      run: python3 scripts/check_accuracy.py
+
+  manual_validation:
+    needs: training_and_testing
+    runs-on: ubuntu-latest
+    if: needs.training_and_testing.outputs.meets_threshold == 'true'
+    outputs:
+      approval_status: ${{ steps.approval.outputs.approval-status }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Create metrics summary for approval
+      run: |
+        cat > model_validation_metrics.md << 'EOF'
+        ## Performance Summary:
+        
+        | Metric | Value |
+        |--------|-------|
+        | **Model Name** | ${{ inputs.model_name }} |
+        | **Version** | ${{ needs.training_and_testing.outputs.model_version }} |
+        | **Accuracy** | ${{ needs.training_and_testing.outputs.accuracy }} |
+        | **Loss** | ${{ needs.training_and_testing.outputs.loss }} |
+        | **Training Time** | ${{ needs.training_and_testing.outputs.training_time }}s |
+        | **Required Threshold** | ${{ needs.training_and_testing.outputs.required_accuracy }} |
+        | **Training Run** | [#${{ github.run_number }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+        
+        ### Training Configuration
+        - **Learning Rate**: ${{ needs.training_and_testing.outputs.learning_rate }}
+        - **Max Epochs**: ${{ needs.training_and_testing.outputs.max_epochs }}
+        - **Dataset Format**: ${{ needs.training_and_testing.outputs.dataset_format }}
+        - **Dataset**: ${{ needs.training_and_testing.outputs.dataset_name || 'Standard MNIST' }}
+        - **Docker Build**: ${{ needs.training_and_testing.outputs.build_push_docker }}
+        - **Build Date**: ${{ needs.training_and_testing.outputs.date }}
+        - **Commit SHA**: ${{ needs.training_and_testing.outputs.short_sha }}
+        
+        ### Performance Analysis
+        - **Accuracy**: ${{ needs.training_and_testing.outputs.accuracy }} (Exceeds ${{ needs.training_and_testing.outputs.required_accuracy }} threshold)
+        - **Final Loss**: ${{ needs.training_and_testing.outputs.loss }}
+        - **Training Duration**: ${{ needs.training_and_testing.outputs.training_time }} seconds
+        
+        ### Review Checklist
+        - [ ] Accuracy meets business requirements (${{ needs.training_and_testing.outputs.accuracy }} ≥ ${{ needs.training_and_testing.outputs.required_accuracy }})
+        - [ ] Training metrics look reasonable
+        - [ ] Model is suitable for production deployment
+        - [ ] No obvious signs of overfitting
+        - [ ] Training time is acceptable
+        - [ ] Loss values are within expected range
+        
+        ### Artifacts & Resources
+        - [Training Artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+        - [Training Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+        - [Docker Image](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) (will be built after approval)
+        
+        ### Post-Approval Actions
+        Upon approval, the following will be automatically executed:
+        - GitHub Release creation
+        - Docker image build and registry push
+        - Production deployment preparation
+        - Final deployment summary
+        
+        ### Approval Instructions
+        **To approve this model for production:**
+        - Comment with: `approve`, `approved`, `lgtm`, or `yes`
+        
+        **To reject this model:**
+        - Comment with: `deny`, `denied`, or `no`
+        - Please provide feedback for improvements
+        
+        ---
+        *Model will be automatically released upon approval.*
+        EOF
+    
+    - name: Request manual approval
+      uses: trstringer/manual-approval@v1
+      timeout-minutes: 15
+      id: approval
+      with:
+        secret: ${{ secrets.GITHUB_TOKEN }}
+        approvers: ${{ github.actor }}
+        minimum-approvals: 1
+        issue-title: "🤖 Validate Model - ${{ inputs.model_name }} ( ${{ needs.training_and_testing.outputs.model_version }} ) | Accuracy - ${{ needs.training_and_testing.outputs.accuracy }}"
+        issue-body-file-path: "model_validation_metrics.md"
+        exclude-workflow-initiator-as-approver: false
+        
+    - name: Upload approval metrics
+      uses: actions/upload-artifact@v4
+      with:
+        name: approval-metrics-${{ needs.training_and_testing.outputs.model_version }}
+        path: model_validation_metrics.md
+        retention-days: 30
+
+  docker_build:
+    needs: [training_and_testing, manual_validation]
+    runs-on: ubuntu-latest
+    if: needs.manual_validation.outputs.approval_status == 'approved' && needs.training_and_testing.outputs.build_push_docker == 'true'
+    
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+
+    outputs:
+      docker_registry: ghcr.io/${{ github.actor }}/${{ inputs.model_name }}
+      docker_tag: ${{ needs.training_and_testing.outputs.model_version }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+        
+    - name: Download training artifacts for Docker build
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.model_name }}-artifacts-${{ needs.training_and_testing.outputs.model_version }}
+        path: ./artifacts
+        
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Build and Push Docker Image to GHCR
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        platforms: linux/amd64
+        push: true
+        tags: |
+          ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}
+          ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:latest
+        cache-from: |
+          type=gha
+        cache-to: |
+          type=gha,mode=max
+        build-args: |
+          BUILDKIT_INLINE_CACHE=1
+          MODEL_NAME=${{ inputs.model_name }}
+        # Optimize for space and speed
+        provenance: false
+        sbom: false
+        
+    - name: Verify Docker Image
+      run: |
+        echo "� Verifying published Docker image..."
+        
+        # Pull the image we just pushed
+        docker pull ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}
+        
+        echo "📊 Docker image size analysis:"
+        docker images --format "table {{.Repository}}:{{.Tag}}\t{{.Size}}" | grep ${{ inputs.model_name }}
+        
+        echo ""
+        echo "🔍 Detailed image inspection:"
+        SIZE_BYTES=$(docker inspect ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }} | jq '.[0].Size')
+        SIZE_MB=$((SIZE_BYTES / 1048576))
+        echo "Image size: ${SIZE_MB}MB"
+        
+        # Fail if image is too large (should be under 1.5GB for CPU-only)
+        if [ $SIZE_MB -gt 1536 ]; then
+          echo "❌ ERROR: Image is too large (${SIZE_MB}MB > 1536MB limit)"
+          echo "This suggests CUDA dependencies are still being installed!"
+          exit 1
+        else
+          echo "✅ SUCCESS: Image size is acceptable (${SIZE_MB}MB)"
+        fi
+        
+    - name: Verify CPU-only PyTorch installation
+      run: |
+        echo "🔍 Verifying Docker image uses CPU-only PyTorch..."
+        docker run --rm ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }} python -c "
+        import torch
+        print(f'PyTorch version: {torch.__version__}')
+        print(f'CUDA available: {torch.cuda.is_available()}')
+        print(f'CUDA device count: {torch.cuda.device_count()}')
+        if torch.cuda.is_available():
+            print('❌ WARNING: CUDA is available - this suggests CUDA PyTorch was installed!')
+            exit(1)
+        else:
+            print('✅ SUCCESS: CPU-only PyTorch confirmed')
+        "
+        
+    - name: Test Docker Container Functionality
+      run: |
+        echo "🧪 Testing Docker container functionality..."
+        
+        # Start container in background
+        docker run -d -p 8000:8000 --name test-container \
+          ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}
+        
+        # Wait for container to start
+        echo "⏳ Waiting for container to start..."
+        sleep 10
+        
+        # Test health endpoint
+        echo "� Testing health endpoint..."
+        curl -f http://localhost:8000/health || (echo "❌ Health check failed" && exit 1)
+        
+        # Test prediction endpoint
+        echo "� Testing prediction endpoint..."
+        python3 -c "
+        import requests
+        import json
+        
+        # Test with zero array (should return prediction)
+        test_data = [0.0] * 784
+        response = requests.post('http://localhost:8000/predict', json={'data': test_data}, timeout=30)
+        
+        if response.status_code == 200:
+            result = response.json()
+            print(f'✅ Prediction successful: digit {result[\"prediction\"]} (confidence: {result[\"confidence\"]:.2%})')
+        else:
+            print(f'❌ Prediction failed: {response.status_code} - {response.text}')
+            exit(1)
+        "
+        
+        # Clean up
+        docker stop test-container
+        docker rm test-container
+        
+        echo "✅ All tests passed! Container is ready for production."
+
+  deploy_artifacts_and_release:
+    needs: [training_and_testing, manual_validation, docker_build]
+    runs-on: ubuntu-latest
+    if: |
+      needs.manual_validation.outputs.approval_status == 'approved' &&
+      (needs.training_and_testing.outputs.build_push_docker != 'true' || 
+       (needs.training_and_testing.outputs.build_push_docker == 'true' && needs.docker_build.result == 'success'))
+    # Note: Waits for docker_build when enabled, runs immediately when Docker is disabled
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python for summary
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        
+    - name: Generate final summary
+      run: |
+        echo "## ${{ inputs.model_name}} Training Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Model | ${{ inputs.model_name }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Version | ${{ needs.training_and_testing.outputs.model_version }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Accuracy | ${{ needs.training_and_testing.outputs.accuracy }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Final Loss | ${{ needs.training_and_testing.outputs.loss }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Training Time | ${{ needs.training_and_testing.outputs.training_time }}s |" >> $GITHUB_STEP_SUMMARY
+        echo "| Status | Approved & Released |" >> $GITHUB_STEP_SUMMARY
+      
+    - name: Download training artifacts for release
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.model_name }}-artifacts-${{ needs.training_and_testing.outputs.model_version }}
+        path: ./release-artifacts
+        
+    - name: Download approval metrics
+      uses: actions/download-artifact@v4
+      with:
+        name: approval-metrics-${{ needs.training_and_testing.outputs.model_version }}
+        path: ./
+        
+    - name: Prepare release assets
+      run: |
+        echo "📦 Preparing release assets..."
+        mkdir -p ./final-release-assets
+        
+        # Copy standard release assets
+        cp ./release-artifacts/checkpoints/${{ inputs.model_name }}.pt ./final-release-assets/
+        cp ./release-artifacts/metrics_*.json ./final-release-assets/ 2>/dev/null || echo "No metrics files found"
+        cp ./model_validation_metrics.md ./final-release-assets/ 2>/dev/null || echo "No validation metrics file found"
+        
+        # Add Docker instructions if available
+        if [ "${{ needs.training_and_testing.outputs.build_push_docker }}" == "true" ] && [ -f "./docker-instructions/docker-usage-instructions.md" ]; then
+          echo "🐳 Adding Docker usage instructions to release assets..."
+          cp ./docker-instructions/docker-usage-instructions.md ./final-release-assets/
+        fi
+        
+        # List final assets
+        echo "📋 Final release assets:"
+        ls -la ./final-release-assets/
+        
+    - name: Create GitHub Release with Assets
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ needs.training_and_testing.outputs.model_version }}
+        name: "${{ needs.training_and_testing.outputs.model_version }}"
+        body: |
+          ## Model: ${{ inputs.model_name }} | Version: ${{ needs.training_and_testing.outputs.model_version }} Released!
+          
+          **Version Details:**
+          - Model: ${{ inputs.model_name }}
+          - Version: ${{ needs.training_and_testing.outputs.model_version }}
+          - Date: ${{ needs.training_and_testing.outputs.date }}
+          - Commit: ${{ needs.training_and_testing.outputs.short_sha }}
+          - Run: #${{ github.run_number }}
+          
+          **Performance Metrics:**
+          - Accuracy: ${{ needs.training_and_testing.outputs.accuracy }}%
+          - Loss: ${{ needs.training_and_testing.outputs.loss }}
+          - Training Time: ${{ needs.training_and_testing.outputs.training_time }}s
+          
+          **Training Configuration:**
+          - Learning Rate: ${{ needs.training_and_testing.outputs.learning_rate }}
+          - Epochs: ${{ needs.training_and_testing.outputs.max_epochs }}
+          - Dataset Format: ${{ needs.training_and_testing.outputs.dataset_format }}
+          - Dataset: ${{ needs.training_and_testing.outputs.dataset_name || 'Standard MNIST' }}
+          
+          **Model Files:**
+          - Trained model checkpoint included as release asset
+          - Training metrics and logs available in artifacts
+          ${{ needs.training_and_testing.outputs.build_push_docker == 'true' && '- Docker usage instructions included as release asset' || '' }}
+          
+          **Local Deployment Instructions: [ Authentication to GHCR Required! ]**
+          
+          **Option 1: Direct Docker Run**
+          ```bash
+          # Pull the approved model
+          docker pull ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}
+          
+          # Run inference server
+          docker run -p 8000:8000 ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}
+          
+          # Test the API
+          curl http://localhost:8000/health
+          ```
+          
+          **Option 2: Docker Compose (Recommended for persistent deployments)**
+          
+          1. Create a `docker-compose.yml` file:
+          ```yaml
+          version: '3.8'
+          
+          services:
+            ${{ inputs.model_name }}-inference:
+              image: ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}
+              container_name: ${{ inputs.model_name }}-inference
+              ports:
+                - "8000:8000"
+              environment:
+                - MODEL_NAME=${{ inputs.model_name }}
+                - MODEL_VERSION=${{ needs.training_and_testing.outputs.model_version }}
+                - LOG_LEVEL=INFO
+              restart: unless-stopped
+          ```
+          
+          2. Deploy with Docker Compose:
+          ```bash
+          # Start the service
+          docker-compose up -d
+          
+          # Check service status
+          docker-compose ps
+          
+          # View logs
+          docker-compose logs -f
+          
+          # Test the API
+          curl http://localhost:8000/health
+          
+          # Stop the service
+          docker-compose down
+          ```
+          
+          ## Testing the Model
+          
+          To test the model inference locally:
+          
+          ```bash
+          
+          # Test prediction (requires 784 values for 28x28 MNIST image)
+          # Quick format check (will return validation error but shows correct structure):
+          curl -X POST http://localhost:8000/predict \
+            -H "Content-Type: application/json" \
+            -d '{"data": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}'
+          
+          # Complete working example with full 784-value array:
+          python3 -c "
+          import requests
+
+          data = [0.0] * 784
+
+          for i in range(350, 450): data[i] = 0.5 + (i % 10) * 0.05
+
+          response = requests.post('http://localhost:8000/predict', json={'data': data})
+
+          print('✅ Prediction result:', response.json()['prediction'], 'confidence:', round(response.json()['confidence'], 3))
+          "
+          ```
+          
+          **API Endpoints:**
+          - `GET /health` - Service health status
+          - `POST /predict` - Model inference with JSON image data
+          
+          **Artifacts:**
+          - [Training Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - [Model Artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          
+          This model has been approved for production use.
+        draft: false
+        prerelease: false
+        files: ./final-release-assets/*
+      
+    - name: Deploy to production (placeholder)
+      run: |
+        echo "Deploying ${{ inputs.model_name }} ${{ needs.training_and_testing.outputs.model_version }}"
+        echo "Model approved and ready for production"
+        echo "Accuracy: ${{ needs.training_and_testing.outputs.accuracy }}%"
+        echo "Release: ${{ needs.training_and_testing.outputs.model_version }}"
+        echo ""
+        echo "Docker Images Available:"
+        echo "   ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}"
+        echo "   ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:latest"
+        echo ""
+        echo "Production deployment steps:"
+        echo "   1. Pull Docker image from registry"
+        echo "   2. Deploy to container orchestration platform"
+        echo "   3. Configure load balancer and monitoring"
+        echo "   4. Run health checks and smoke tests"
+        
+    - name: Notify deployment success
+      run: |
+        echo "## Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**${{ inputs.model_name }} ${{ needs.training_and_testing.outputs.model_version }}** has been successfully deployed!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Final Metrics:" >> $GITHUB_STEP_SUMMARY
+        echo "- **Accuracy**: ${{ needs.training_and_testing.outputs.accuracy }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Loss**: ${{ needs.training_and_testing.outputs.loss }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Training Time**: ${{ needs.training_and_testing.outputs.training_time }}s" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Training Configuration:" >> $GITHUB_STEP_SUMMARY
+        echo "- **Dataset Format**: ${{ needs.training_and_testing.outputs.dataset_format }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Dataset**: ${{ needs.training_and_testing.outputs.dataset_name || 'Standard MNIST' }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Docker Images:" >> $GITHUB_STEP_SUMMARY
+        echo "- \`ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- \`ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:latest\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Quick Start:" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+        echo "docker pull ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}" >> $GITHUB_STEP_SUMMARY
+        echo "docker run -p 8000:8000 ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "[GitHub Release](https://github.com/${{ github.repository }}/releases/tag/${{ needs.training_and_testing.outputs.model_version }})" >> $GITHUB_STEP_SUMMARY
+
+  aws_ecs_deployment:
+    needs: [training_and_testing, manual_validation, deploy_artifacts_and_release]
+    runs-on: ubuntu-latest
+    if: needs.manual_validation.outputs.approval_status == 'approved'
+    # Note: This is a mock deployment step - assumes AWS ECS infrastructure already exists
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials (Mock)
+      run: |
+        echo "🔧 Configuring AWS credentials..."
+        echo "   ⚠️  MOCK: In production, configure with real AWS credentials:"
+        echo "   - AWS_ACCESS_KEY_ID"
+        echo "   - AWS_SECRET_ACCESS_KEY" 
+        echo "   - AWS_REGION"
+        echo ""
+        echo "   📋 Example real configuration:"
+        echo "   uses: aws-actions/configure-aws-credentials@v4"
+        echo "   with:"
+        echo "     aws-access-key-id: \${{ secrets.AWS_ACCESS_KEY_ID }}"
+        echo "     aws-secret-access-key: \${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+        echo "     aws-region: us-east-1"
+        echo ""
+        echo "✅ Mock AWS credentials configured"
+
+    - name: Push Docker image to AWS ECR (Mock)
+      run: |
+        echo "🐳 Pushing Docker image to AWS ECR..."
+        echo ""
+        echo "   ⚠️  MOCK: Real commands would be:"
+        echo "   # Login to ECR"
+        echo "   aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 123456789012.dkr.ecr.us-east-1.amazonaws.com"
+        echo ""
+        echo "   # Tag image for ECR"
+        echo "   docker tag ghcr.io/${{ github.actor }}/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }} \\"
+        echo "     123456789012.dkr.ecr.us-east-1.amazonaws.com/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}"
+        echo ""
+        echo "   # Push to ECR"
+        echo "   docker push 123456789012.dkr.ecr.us-east-1.amazonaws.com/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}"
+        echo ""
+        echo "✅ Mock: Docker image pushed to ECR"
+        echo "📦 Mock ECR URI: 123456789012.dkr.ecr.us-east-1.amazonaws.com/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}"
+
+    - name: Update ECS Task Definition (Mock)
+      run: |
+        echo "📋 Updating ECS Task Definition..."
+        echo ""
+        echo "   ⚠️  MOCK: Real workflow would:"
+        echo "   1. Download existing task definition"
+        echo "   2. Update image URI to new version"
+        echo "   3. Register new task definition (AWS auto-generates revision number)"
+        echo ""
+        echo "   📋 Mock task definition update:"
+        echo "   Service: Woven Adaptive Vision Service"
+        echo "   Task Definition Family: ${{ inputs.model_name }}-task"
+        echo "   New Image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}"
+        echo "   CPU: 256"
+        echo "   Memory: 512"
+        echo "   Port: 8000"
+        echo ""
+        echo "   ⚠️  Real commands would be:"
+        echo "   # Download current task definition"
+        echo "   aws ecs describe-task-definition --task-definition ${{ inputs.model_name }}-task --query taskDefinition > task-definition.json"
+        echo ""
+        echo "   # Update image URI (using jq or sed)"
+        echo "   jq '.containerDefinitions[0].image = \"123456789012.dkr.ecr.us-east-1.amazonaws.com/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}\"' task-definition.json > updated-task-definition.json"
+        echo ""
+        echo "   # Register new task definition (AWS auto-generates revision number)"
+        echo "   TASK_DEF_ARN=\$(aws ecs register-task-definition --cli-input-json file://updated-task-definition.json --query 'taskDefinition.taskDefinitionArn' --output text)"
+        echo "   NEW_REVISION=\$(echo \$TASK_DEF_ARN | cut -d':' -f6)"
+        echo ""
+        echo "✅ Mock: New task definition registered with auto-generated revision"
+        
+        # Simulate a realistic revision number
+        MOCK_REVISION=$((RANDOM % 50 + 10))
+        echo "📋 Mock: ${{ inputs.model_name }}-task:${MOCK_REVISION} (AWS auto-generated)"
+        echo "MOCK_TASK_REVISION=${MOCK_REVISION}" >> $GITHUB_ENV
+
+    - name: Deploy to ECS Service (Mock)
+      run: |
+        echo "🚀 Deploying to ECS Service..."
+        echo ""
+        echo "   ⚠️  MOCK: Triggering deployment of ECS service:"
+        echo "   Service Name: Woven Adaptive Vision Service"
+        echo "   Cluster: production-cluster"
+        echo "   Task Definition: ${{ inputs.model_name }}-task:${{ env.MOCK_TASK_REVISION }}"
+        echo ""
+        echo "   ⚠️  Real command would be:"
+        echo "   aws ecs update-service \\"
+        echo "     --cluster production-cluster \\"
+        echo "     --service \"Woven Adaptive Vision Service\" \\"
+        echo "     --task-definition \$TASK_DEF_ARN \\"
+        echo "     --force-new-deployment"
+        echo ""
+        echo "   📝 Note: You use the full ARN returned from register-task-definition,"
+        echo "           not a custom revision number"
+        echo ""
+        echo "✅ Mock: ECS service deployment initiated"
+        echo "⏳ Mock: Deployment in progress..."
+        
+        # Simulate deployment time
+        sleep 5
+        
+        echo "✅ Mock: Deployment completed successfully"
+
+    - name: Verify ECS Deployment (Mock)
+      run: |
+        echo "🔍 Verifying ECS deployment..."
+        echo ""
+        echo "   ⚠️  MOCK: Real verification would check:"
+        echo "   1. Service status and health"
+        echo "   2. Task health checks"
+        echo "   3. Load balancer health"
+        echo "   4. API endpoint availability"
+        echo ""
+        echo "   ⚠️  Real commands would be:"
+        echo "   # Check service status"
+        echo "   aws ecs describe-services --cluster production-cluster --services \"Woven Adaptive Vision Service\""
+        echo ""
+        echo "   # Wait for deployment to complete"
+        echo "   aws ecs wait services-stable --cluster production-cluster --services \"Woven Adaptive Vision Service\""
+        echo ""
+        echo "   # Test API endpoint"
+        echo "   curl -f https://mnist-api.production.example.com/health"
+        echo ""
+        echo "✅ Mock: Deployment verification completed"
+        echo "🌐 Mock: Service available at https://mnist-api.production.example.com"
+        echo "📊 Mock: Model version ${{ needs.training_and_testing.outputs.model_version }} is now serving traffic"
+
+    - name: Deployment Summary
+      run: |
+        echo "## 🚀 AWS ECS Deployment Completed!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Woven Adaptive Vision Service** has been successfully deployed to AWS ECS!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Deployment Details:" >> $GITHUB_STEP_SUMMARY
+        echo "- **Model Version**: ${{ needs.training_and_testing.outputs.model_version }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Accuracy**: ${{ needs.training_and_testing.outputs.accuracy }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **ECR Image**: 123456789012.dkr.ecr.us-east-1.amazonaws.com/${{ inputs.model_name }}:${{ needs.training_and_testing.outputs.model_version }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **ECS Service**: Woven Adaptive Vision Service" >> $GITHUB_STEP_SUMMARY
+        echo "- **ECS Cluster**: production-cluster" >> $GITHUB_STEP_SUMMARY
+        echo "- **Task Definition**: ${{ inputs.model_name }}-task:${MOCK_TASK_REVISION} (auto-generated by AWS)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Service Endpoints:" >> $GITHUB_STEP_SUMMARY
+        echo "- **Health Check**: https://mnist-api.production.example.com/health" >> $GITHUB_STEP_SUMMARY
+        echo "- **API Documentation**: https://mnist-api.production.example.com/docs" >> $GITHUB_STEP_SUMMARY
+        echo "- **Prediction Endpoint**: POST https://mnist-api.production.example.com/predict" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### AWS ECS Best Practices:" >> $GITHUB_STEP_SUMMARY
+        echo "- Task definition revisions are auto-generated by AWS (cannot specify custom numbers)" >> $GITHUB_STEP_SUMMARY
+        echo "- Use full task definition ARN when updating services" >> $GITHUB_STEP_SUMMARY
+        echo "- Monitor deployment progress with \`aws ecs wait services-stable\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Next Steps:" >> $GITHUB_STEP_SUMMARY
+        echo "- Monitor service performance and error rates" >> $GITHUB_STEP_SUMMARY
+        echo "- Set up CloudWatch alarms and dashboards" >> $GITHUB_STEP_SUMMARY
+        echo "- Run integration tests against production endpoint" >> $GITHUB_STEP_SUMMARY
+        echo "- Update documentation with new model version" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**⚠️ Note**: This was a mock deployment for demonstration purposes" >> $GITHUB_STEP_SUMMARY

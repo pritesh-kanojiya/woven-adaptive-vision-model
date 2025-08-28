@@ -1,0 +1,23 @@
+# Essential dependencies - minimal and focused
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.21.0
+matplotlib>=3.5.0
+pyyaml>=6.0
+scikit-learn>=1.0.0
+Pillow>=8.3.0
+
+# For logging and reporting
+seaborn>=0.11.0
+pandas>=1.3.0
+
+# For flexible data loading
+requests>=2.25.0
+datasets>=2.14.0
+
+# For future Docker deployment
+fastapi>=0.68.0
+uvicorn>=0.15.0
+
+# For testing (minimal)
+pytest>=6.2.0
